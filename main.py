@@ -22,7 +22,7 @@ CANAL_ORIGEM_STR = os.getenv('CANAL_ORIGEM', '')
 CANAL_DESTINO_STR = os.getenv('CANAL_DESTINO', '')
 TOPICOS_IGNORADOS_STR = os.getenv('TOPICOS_IGNORADOS', '')
 
-# diretorio para armazenar o mapeamento de tópicos
+# dirs
 MAPPINGS_DIR = "./mappings"
 os.makedirs(MAPPINGS_DIR, exist_ok=True)
 
