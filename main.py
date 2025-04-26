@@ -316,9 +316,11 @@ async def main():
             
             # if has media, download and send
             if message.media:
-                logger.info(f"Mensagem com mídia detectada de {sender_name}")
+                media_type = type(message.media).__name__
+
+                logger.info(f"Mensagem com mídia do tipo {media_type} detectada de {sender_name}")
                 
-                path = await message.download_media("./downloads/")
+                path = await message.download_media("./downloads/", progress_callback=None, timeout=300)
                 
                 caption = f"{prefix}{message.text}" if message.text else prefix.rstrip(" -")
                 
@@ -327,6 +329,9 @@ async def main():
                         await client.send_file(
                             canal_destino_entity,
                             path,
+                            supports_streaming=True, # support for videos
+                            upload_progress_callback=None,
+                            timeout=300,
                             caption=caption,
                             reply_to=destino_topic_id
                         )
@@ -405,9 +410,11 @@ async def main():
                 destino_topic_id = await get_or_create_topic(topic_title, topic_id)
             
             if message.media:
-                logger.info(f"Mensagem editada com mídia detectada de {sender_name}")
+                media_type = type(message.media).__name__
                 
-                path = await message.download_media("./downloads/")
+                logger.info(f"Mensagem com mídia do tipo {media_type} detectada de {sender_name}")
+                
+                path = await message.download_media("./downloads/", progress_callback=None, timeout=300)
                 
                 caption = f"[EDITADO] {prefix}{message.text}" if message.text else f"[EDITADO] {prefix}".rstrip(" -")
                 
@@ -416,6 +423,9 @@ async def main():
                         await client.send_file(
                             canal_destino_entity,
                             path,
+                            supports_streaming=True, # for videos
+                            upload_progress_callback=None,
+                            timeout=300,
                             caption=caption,
                             reply_to=destino_topic_id
                         )
