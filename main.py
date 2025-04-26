@@ -331,7 +331,6 @@ async def main():
                             path,
                             supports_streaming=True, # support for videos
                             upload_progress_callback=None,
-                            timeout=300,
                             caption=caption,
                             reply_to=destino_topic_id
                         )
@@ -425,7 +424,6 @@ async def main():
                             path,
                             supports_streaming=True, # for videos
                             upload_progress_callback=None,
-                            timeout=300,
                             caption=caption,
                             reply_to=destino_topic_id
                         )
