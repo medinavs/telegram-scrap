@@ -6,6 +6,8 @@ import os
 import logging
 import json
 from dotenv import load_dotenv
+import discord
+from discord.ext import commands
 
 os.makedirs("./downloads", exist_ok=True)
 
@@ -15,12 +17,17 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+# telegram Config
 API_ID = int(os.getenv('API_ID', 0))
 API_HASH = os.getenv('API_HASH', '')
 SESSION_NAME = 'user_session'
 CANAL_ORIGEM_STR = os.getenv('CANAL_ORIGEM', '')
-CANAL_DESTINO_STR = os.getenv('CANAL_DESTINO', '')
 TOPICOS_IGNORADOS_STR = os.getenv('TOPICOS_IGNORADOS', '')
+
+# discord Config
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN', '')
+DISCORD_GUILD_ID = int(os.getenv('DISCORD_GUILD_ID', 0))
+DISCORD_CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', 0)) # channel id to send messages
 
 # dirs
 MAPPINGS_DIR = "./mappings"
@@ -44,34 +51,37 @@ if TOPICOS_IGNORADOS_STR:
 
 try:
     CANAL_ORIGEM = int(CANAL_ORIGEM_STR.strip('"').strip("'")) if CANAL_ORIGEM_STR and CANAL_ORIGEM_STR.strip('"').strip("'").startswith('-') else CANAL_ORIGEM_STR.strip('"').strip("'")
-    CANAL_DESTINO = int(CANAL_DESTINO_STR.strip('"').strip("'")) if CANAL_DESTINO_STR and CANAL_DESTINO_STR.strip('"').strip("'").startswith('-') else CANAL_DESTINO_STR.strip('"').strip("'")
 except ValueError as e:
     logger.error(f"Erro ao converter canal: {e}")
     exit(1)
 
-if not API_ID or not API_HASH or not CANAL_ORIGEM or not CANAL_DESTINO:
-    logger.error("Por favor, configure as variáveis de ambiente API_ID, API_HASH, CANAL_ORIGEM e CANAL_DESTINO")
+if not API_ID or not API_HASH or not CANAL_ORIGEM or not DISCORD_TOKEN or not DISCORD_CHANNEL_ID:
+    logger.error("Por favor, configure as variáveis de ambiente API_ID, API_HASH, CANAL_ORIGEM, DISCORD_TOKEN e DISCORD_CHANNEL_ID")
     exit(1)
 
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+telegram_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
-# mapper of topics on channels
+# config discord with intents
+intents = discord.Intents.default()
+intents.message_content = True
+intents.guilds = True
+discord_client = commands.Bot(command_prefix="!", intents=intents)
+
+# mapper of telegram topics to discord channels
 class TopicMapper:
-    def __init__(self, origem_id, destino_id):
+    def __init__(self, origem_id):
         self.origem_id = str(origem_id)
-        self.destino_id = str(destino_id)
         
-        #map of topics: {id_topico_origem: id_topico_destino}
+        # map of topics: {id_topico_origem: id_canal_discord}
         self.topic_mapping = {}
         
         # name of the file to store the mapping
-        self.mapping_file = os.path.join(MAPPINGS_DIR, f"topic_mapping_{self.origem_id}_{self.destino_id}.json")
+        self.mapping_file = os.path.join(MAPPINGS_DIR, f"topic_mapping_{self.origem_id}_discord.json")
         
         # load if exists
         self._load_mapping()
     
     def _load_mapping(self):
-        """Carrega o mapeamento de tópicos do arquivo"""
         if os.path.exists(self.mapping_file):
             try:
                 with open(self.mapping_file, 'r') as f:
@@ -84,7 +94,6 @@ class TopicMapper:
                 self.topic_mapping = {}
     
     def _save_mapping(self):
-        """Salva o mapeamento de tópicos em um arquivo"""
         try:
             with open(self.mapping_file, 'w') as f:
                 # stringify to serialize
@@ -94,146 +103,112 @@ class TopicMapper:
         except Exception as e:
             logger.error(f"Erro ao salvar mapeamento de tópicos: {e}")
     
-    def get_target_topic_id(self, origem_topic_id):
-        """Obtém o ID do tópico correspondente no grupo de destino"""
+    def get_discord_channel_id(self, origem_topic_id):
         return self.topic_mapping.get(origem_topic_id)
     
-    def add_topic_mapping(self, origem_topic_id, destino_topic_id):
-        """Adiciona um novo mapeamento de tópicos"""
-        self.topic_mapping[origem_topic_id] = destino_topic_id
+    def add_topic_mapping(self, origem_topic_id, discord_channel_id):
+        self.topic_mapping[origem_topic_id] = discord_channel_id
         self._save_mapping()
-        logger.info(f"Novo mapeamento de tópico adicionado: {origem_topic_id} -> {destino_topic_id}")
+        logger.info(f"Novo mapeamento de tópico adicionado: {origem_topic_id} -> {discord_channel_id}")
 
 async def main():
-    await client.start()
+    # init telegram client
+    await telegram_client.start()
     logger.info("Cliente Telegram conectado com sucesso!")
+    
+    # init client discord
+    discord_client.remove_command('help')
+    
+    @discord_client.event
+    async def on_ready():
+        logger.info(f'Discord Bot conectado como {discord_client.user}')
+        logger.info(f'ID do Bot: {discord_client.user.id}')
+        
+        # check channels and permissions
+        guild = discord_client.get_guild(DISCORD_GUILD_ID)
+        if not guild:
+            logger.error(f"Não foi possível encontrar o servidor Discord com ID {DISCORD_GUILD_ID}")
+            return
+            
+        channel = guild.get_channel(DISCORD_CHANNEL_ID)
+        if not channel:
+            logger.error(f"Não foi possível encontrar o canal Discord com ID {DISCORD_CHANNEL_ID}")
+            return
+            
+        logger.info(f"Servidor Discord: {guild.name} (ID: {guild.id})")
+        logger.info(f"Canal Discord principal: {channel.name} (ID: {channel.id})")
+        
+        # start telegram handlers
+        await setup_telegram_handlers()
+    
+    # start discord client as background task
+    asyncio.create_task(discord_client.start(DISCORD_TOKEN))
     
     # config log
     logger.info(f"CANAL_ORIGEM: {CANAL_ORIGEM}")
-    logger.info(f"CANAL_DESTINO: {CANAL_DESTINO}")
     logger.info(f"TÓPICOS IGNORADOS: {TOPICOS_IGNORADOS}")
 
-    # channels entities
+    # origen channel entity
     try:
-        canal_origem_entity = await client.get_entity(CANAL_ORIGEM)
-        canal_destino_entity = await client.get_entity(CANAL_DESTINO)
-        
+        canal_origem_entity = await telegram_client.get_entity(CANAL_ORIGEM)
         origem_id = canal_origem_entity.id
-        destino_id = canal_destino_entity.id
         
         logger.info(f"Canal de origem: {getattr(canal_origem_entity, 'title', CANAL_ORIGEM)} (ID: {origem_id})")
-        logger.info(f"Canal de destino: {getattr(canal_destino_entity, 'title', CANAL_DESTINO)} (ID: {destino_id})")
-        
-        suporta_forum = False
-        try:
-            grupo_completo = await client(functions.channels.GetFullChannelRequest(
-                channel=canal_destino_entity
-            ))
-            
-            # check if is active
-            if hasattr(grupo_completo, 'full_chat') and hasattr(grupo_completo.full_chat, 'forum_topics_active'):
-                suporta_forum = grupo_completo.full_chat.forum_topics_active
-            else:
-                suporta_forum = isinstance(canal_destino_entity, Channel) and canal_destino_entity.megagroup
-            
-            logger.info(f"Canal de destino suporta fóruns: {suporta_forum}")
-            
-            if not suporta_forum:
-                logger.warning("""
-                O canal de destino não parece suportar tópicos/fóruns.
-                Certifique-se de que:
-                1. O grupo é um supergrupo
-                2. Os fóruns estão habilitados nas configurações do grupo
-                3. Você tem permissões administrativas no grupo
-                
-                Continuando sem criar tópicos (todas as mensagens serão enviadas ao grupo principal)
-                """)
-                
-        except Exception as e:
-            logger.warning(f"Não foi possível verificar se o canal de destino suporta fóruns: {e}")
-            logger.warning("Continuando sem criar tópicos")
-            suporta_forum = False
         
         # instance of the topic mapper
-        topic_mapper = TopicMapper(origem_id, destino_id)
+        topic_mapper = TopicMapper(origem_id)
         
     except Exception as e:
-        logger.error(f"Erro ao obter canais: {e}")
-        await client.disconnect()
+        logger.error(f"Erro ao obter canal origem: {e}")
+        await telegram_client.disconnect()
         exit(1)
 
-    async def get_default_topic_id():
-        """Tenta obter o ID do tópico 'General' ou outro padrão"""
-        try:
-            if not suporta_forum:
-                return None
-                
-            forum_topics = await client(functions.channels.GetForumTopicsRequest(
-                channel=canal_destino_entity,
-                offset_date=0,
-                offset_id=0,
-                offset_topic=0,
-                limit=10,
-                q=""
-            ))
-            
-            for topic in forum_topics.topics:
-                if topic.title.lower() in ["general", "geral", "chat geral"]:
-                    logger.info(f"Encontrado tópico padrão: {topic.title} (ID: {topic.id})")
-                    return topic.id
-                    
-            return None
-            
-        except Exception as e:
-            logger.error(f"Erro ao buscar tópico padrão: {e}")
-            return None
-
-    async def get_or_create_topic(topic_title, origem_topic_id):
+    async def get_or_create_discord_channel(topic_title, telegram_topic_id):
         """
-        Obtém ou cria um tópico no canal de destino com o mesmo título
-        do tópico original
+        Obtém ou cria um canal no Discord com o mesmo título do tópico do Telegram
         """
-        if not suporta_forum:
-            return None
-            
-        destino_topic_id = topic_mapper.get_target_topic_id(origem_topic_id)
-        if destino_topic_id:
-            return destino_topic_id
+        discord_channel_id = topic_mapper.get_discord_channel_id(telegram_topic_id)
+        if discord_channel_id:
+            # check if exists
+            channel = discord_client.get_channel(discord_channel_id)
+            if channel:
+                return channel
         
         try:
-            result = await client(functions.channels.CreateForumTopicRequest(
-                channel=canal_destino_entity,
-                title=topic_title,
-                icon_color=0,  # Cor padrão
-            ))
+            guild = discord_client.get_guild(DISCORD_GUILD_ID)
+            if not guild:
+                logger.error("Servidor Discord não encontrado")
+                return None
             
-            new_topic_id = result.topic.id
+            # create a new channel with the same name as the topic
+            safe_name = ''.join(c for c in topic_title.lower() if c.isalnum() or c in '-_').replace(' ', '-')
+            if not safe_name:
+                safe_name = f"topic-{telegram_topic_id}"
+                
+            # check if channel already exists
+            existing_channel = discord.utils.get(guild.text_channels, name=safe_name)
+            if existing_channel:
+                topic_mapper.add_topic_mapping(telegram_topic_id, existing_channel.id)
+                return existing_channel
             
-            topic_mapper.add_topic_mapping(origem_topic_id, new_topic_id)
+            # create a new channel
+            new_channel = await guild.create_text_channel(
+                name=safe_name,
+                topic=f"Tópico importado do Telegram: {topic_title}"
+            )
             
-            logger.info(f"Novo tópico criado: '{topic_title}' (ID: {new_topic_id})")
-            return new_topic_id
+            topic_mapper.add_topic_mapping(telegram_topic_id, new_channel.id)
+            logger.info(f"Novo canal Discord criado: '{new_channel.name}' (ID: {new_channel.id})")
+            return new_channel
             
-        except ChatAdminRequiredError:
-            logger.error(f"Erro ao criar tópico: Permissões administrativas necessárias no grupo de destino")
+        except discord.errors.Forbidden:
+            logger.error("Erro ao criar canal: Permissões insuficientes no Discord")
             return None
         except Exception as e:
-            logger.error(f"Erro ao criar tópico '{topic_title}': {e}")
-            
-            default_topic = await get_default_topic_id()
-            if default_topic:
-                topic_mapper.add_topic_mapping(origem_topic_id, default_topic)
-                logger.info(f"Usando tópico padrão (ID: {default_topic}) para mensagens do tópico original: {topic_title}")
-                return default_topic
-                
+            logger.error(f"Erro ao criar canal Discord para tópico '{topic_title}': {e}")
             return None
 
     async def get_topic_info(message):
-        """
-        Extrai informações do tópico da mensagem:
-        - ID do tópico
-        - Título do tópico (requer consulta adicional)
-        """
         topic_id = None
         
         if hasattr(message, 'reply_to') and message.reply_to:
@@ -252,226 +227,229 @@ async def main():
         
         try:
             # try to obtain the topics from the channel
-            forum_topics = await client(functions.channels.GetForumTopicsRequest(
-                channel=canal_origem_entity,
-                offset_date=0,
-                offset_id=0,
-                offset_topic=0,
-                limit=100,
-                q=""
-            ))
+            forum_topics = await telegram_client.get_messages(
+                canal_origem_entity,
+                ids=types.InputMessageID(topic_id)
+            )
             
-            for topic in forum_topics.topics:
-                if topic.id == topic_id:
-                    return topic_id, topic.title
-            
-            return topic_id, f"Tópico {topic_id}"
+            if forum_topics:
+                return topic_id, getattr(forum_topics[0], 'topic', {}).get('title', f"Tópico {topic_id}")
+            else:
+                return topic_id, f"Tópico {topic_id}"
             
         except Exception as e:
             logger.warning(f"Não foi possível obter título do tópico {topic_id}: {e}")
-            return topic_id, f"Tópico {topic_id}"
+            try:
+                # second method to obtain the topic title
+                forum_topics = await telegram_client(functions.channels.GetForumTopicsRequest(
+                    channel=canal_origem_entity,
+                    offset_date=0,
+                    offset_id=0,
+                    offset_topic=0,
+                    limit=100,
+                    q=""
+                ))
+                
+                for topic in forum_topics.topics:
+                    if topic.id == topic_id:
+                        return topic_id, topic.title
+                
+                return topic_id, f"Tópico {topic_id}"
+            except Exception as e2:
+                logger.warning(f"Segunda tentativa falhou: {e2}")
+                return topic_id, f"Tópico {topic_id}"
 
-    # events
-    @client.on(events.NewMessage(chats=canal_origem_entity))
-    async def on_new_message(event):
-        message = event.message
-        
-        try:
-            if hasattr(message, 'chat'):
-                chat = message.chat
-                chat_id = getattr(chat, 'id', 'desconhecido')
-                chat_title = getattr(chat, 'title', 'desconhecido')
-                logger.info(f"Origem: Chat ID {chat_id}, Título: {chat_title}")
-            elif hasattr(event, 'chat'):
-                chat = event.chat
-                chat_id = getattr(chat, 'id', 'desconhecido')
-                chat_title = getattr(chat, 'title', 'desconhecido')
-                logger.info(f"Origem (via event): Chat ID {chat_id}, Título: {chat_title}")
+    async def setup_telegram_handlers():
+        # telegram handlers
+        @telegram_client.on(events.NewMessage(chats=canal_origem_entity))
+        async def on_new_message(event):
+            message = event.message
+            
+            try:
+                topic_id = None
+                if hasattr(message, 'reply_to') and message.reply_to:
+                    if hasattr(message.reply_to, 'reply_to_top_id') and message.reply_to.reply_to_top_id:
+                        topic_id = message.reply_to.reply_to_top_id
+                        if topic_id in TOPICOS_IGNORADOS:
+                            logger.info(f"Mensagem do tópico ignorado: {topic_id}")
+                            return
+                
+                sender = await event.get_sender()
+                sender_name = getattr(sender, 'first_name', '') or getattr(sender, 'title', '')
+                if hasattr(sender, 'last_name') and sender.last_name:
+                    sender_name += f" {sender.last_name}"
+                
+                if not sender_name:
+                    sender_name = getattr(sender, 'username', '') or f"ID:{sender.id}"
+                
+                prefix = f"{sender_name} - "
+                
+                topic_id, topic_title = await get_topic_info(message)
+                
+                discord_channel = None
+                
+                if topic_id:
+                    logger.info(f"Mensagem do tópico: {topic_title} (ID: {topic_id})")
+                    discord_channel = await get_or_create_discord_channel(topic_title, topic_id)
+                
+                # if no topic or no channel created, use the default channel
+                if not discord_channel:
+                    discord_channel = discord_client.get_channel(DISCORD_CHANNEL_ID)
+                
+                # if has media, download and send
+                if message.media:
+                    logger.info(f"Mensagem com mídia detectada de {sender_name}")
+                    
+                    path = await message.download_media("./downloads/")
+                    
+                    caption = f"{prefix}{message.text}" if message.text else prefix.rstrip(" -")
+                    
+                    # send to discord
+                    try:
+                        # create discord file
+                        discord_file = discord.File(path)
+                        
+                        # send message with file
+                        await discord_channel.send(content=caption, file=discord_file)
+                        logger.info(f"Mídia enviada para o canal Discord: {discord_channel.name}")
+                        
+                    except discord.errors.HTTPException as e:
+                        # if file is too large
+                        if e.status == 413: 
+                            await discord_channel.send(
+                                f"{caption}\n\n**[ARQUIVO MUITO GRANDE PARA SER ENVIADO]**\n"
+                            )
+                            logger.warning(f"Arquivo muito grande para enviar ao Discord: {path}")
+                        else:
+                            logger.error(f"Erro HTTP ao enviar mídia: {e}")
+                            await discord_channel.send(f"{caption}\n\n**[ERRO AO ENVIAR MÍDIA]**")
+                    except Exception as e:
+                        logger.error(f"Erro ao enviar mídia para Discord: {e}")
+                        await discord_channel.send(f"{caption}\n\n**[ERRO AO ENVIAR MÍDIA]**")
+                    
+                    # clean up the downloaded file
+                    try:
+                        os.remove(path)
+                    except:
+                        pass
+                else:
+                    formatted_text = f"{prefix}{message.text}"
+                    
+                    # send to discord
+                    try:
+                        # break the text into chunks if too long
+                        if len(formatted_text) > 2000:
+                            chunks = [formatted_text[i:i+1999] for i in range(0, len(formatted_text), 1999)]
+                            for i, chunk in enumerate(chunks):
+                                if i == 0:
+                                    await discord_channel.send(chunk)
+                                else:
+                                    await discord_channel.send(f"(Continuação) {chunk}")
+                        else:
+                            await discord_channel.send(formatted_text)
+                        
+                        logger.info(f"Mensagem de texto enviada para o canal Discord: {discord_channel.name}")
+                    except Exception as e:
+                        logger.error(f"Erro ao enviar texto para Discord: {e}")
+                    
+            except Exception as e:
+                logger.error(f"Erro ao processar mensagem: {e}")
 
-            topic_id = None
-            if hasattr(message, 'reply_to') and message.reply_to:
-                if hasattr(message.reply_to, 'reply_to_top_id') and message.reply_to.reply_to_top_id:
-                    topic_id = message.reply_to.reply_to_top_id
-                    if topic_id in TOPICOS_IGNORADOS:
-                        logger.info(f"Mensagem do tópico ignorado: {topic_id}")
-                        return
+        @telegram_client.on(events.MessageEdited(chats=canal_origem_entity))
+        async def on_edit(event):
+            message = event.message
             
-            sender = await event.get_sender()
-            sender_name = getattr(sender, 'first_name', '') or getattr(sender, 'title', '')
-            if hasattr(sender, 'last_name') and sender.last_name:
-                sender_name += f" {sender.last_name}"
-            
-            if not sender_name:
-                sender_name = getattr(sender, 'username', '') or f"ID:{sender.id}"
-            
-            prefix = f"{sender_name} - "
-            
-            topic_id, topic_title = await get_topic_info(message)
-            
-            destino_topic_id = None
-            
-            if topic_id and suporta_forum:
-                logger.info(f"Mensagem do tópico: {topic_title} (ID: {topic_id})")
-                destino_topic_id = await get_or_create_topic(topic_title, topic_id)
-            
-            # if has media, download and send
-            if message.media:
-                logger.info(f"Mensagem com mídia detectada de {sender_name}")
+            try:
+                topic_id = None
+                if hasattr(message, 'reply_to') and message.reply_to:
+                    if hasattr(message.reply_to, 'reply_to_top_id') and message.reply_to.reply_to_top_id:
+                        topic_id = message.reply_to.reply_to_top_id
+                        if topic_id in TOPICOS_IGNORADOS:
+                            logger.info(f"Mensagem do tópico ignorado: {topic_id}")
+                            return
                 
-                path = await message.download_media("./downloads/")
+                sender = await event.get_sender()
+                sender_name = getattr(sender, 'first_name', '') or getattr(sender, 'title', '')
+                if hasattr(sender, 'last_name') and sender.last_name:
+                    sender_name += f" {sender.last_name}"
                 
-                caption = f"{prefix}{message.text}" if message.text else prefix.rstrip(" -")
+                if not sender_name:
+                    sender_name = getattr(sender, 'username', '') or f"ID:{sender.id}"
                 
-                if destino_topic_id:
+                prefix = f"{sender_name} - "
+                
+                topic_id, topic_title = await get_topic_info(message)
+                
+                discord_channel = None
+                
+                if topic_id:
+                    logger.info(f"Mensagem editada do tópico: {topic_title} (ID: {topic_id})")
+                    discord_channel = await get_or_create_discord_channel(topic_title, topic_id)
+                
+                # if no topic or no channel created, use the default channel
+                if not discord_channel:
+                    discord_channel = discord_client.get_channel(DISCORD_CHANNEL_ID)
+                
+                if message.media:
+                    logger.info(f"Mensagem editada com mídia detectada de {sender_name}")
+                    
+                    path = await message.download_media("./downloads/")
+                    
+                    caption = f"[EDITADO] {prefix}{message.text}" if message.text else f"[EDITADO] {prefix}".rstrip(" -")
+                    
+                    # send to discord
                     try:
-                        await client.send_file(
-                            canal_destino_entity,
-                            path,
-                            caption=caption,
-                            reply_to=destino_topic_id
-                        )
-                        logger.info(f"Mídia enviada para o tópico {destino_topic_id}")
+                        discord_file = discord.File(path)
+                        await discord_channel.send(content=caption, file=discord_file)
+                        logger.info(f"Mídia editada enviada para o canal Discord: {discord_channel.name}")
+                    except discord.errors.HTTPException as e:
+                        if e.status == 413:
+                            await discord_channel.send(
+                                f"{caption}\n\n**[ARQUIVO MUITO GRANDE PARA SER ENVIADO]**\n"
+                            )
+                        else:
+                            logger.error(f"Erro HTTP ao enviar mídia editada: {e}")
+                            await discord_channel.send(f"{caption}\n\n**[ERRO AO ENVIAR MÍDIA]**")
                     except Exception as e:
-                        logger.error(f"Erro ao enviar mídia para tópico {destino_topic_id}: {e}")
-                        await client.send_file(
-                            canal_destino_entity,
-                            path,
-                            caption=caption
-                        )
-                        logger.info("Mídia enviada para o grupo principal (fallback)")
-                else:
-                    await client.send_file(
-                        canal_destino_entity,
-                        path,
-                        caption=caption
-                    )
-                    logger.info("Mídia enviada para o grupo principal")
-                
-                try:
-                    os.remove(path)
-                except:
-                    pass
-            else:
-                formatted_text = f"{prefix}{message.text}"
-                
-                if destino_topic_id:
+                        logger.error(f"Erro ao enviar mídia editada para Discord: {e}")
+                        await discord_channel.send(f"{caption}\n\n**[ERRO AO ENVIAR MÍDIA EDITADA]**")
+                    
                     try:
-                        await client.send_message(
-                            canal_destino_entity,
-                            formatted_text,
-                            reply_to=destino_topic_id
-                        )
-                        logger.info(f"Mensagem de texto enviada para o tópico {destino_topic_id}")
-                    except Exception as e:
-                        logger.error(f"Erro ao enviar mensagem para tópico {destino_topic_id}: {e}")
-                        await client.send_message(canal_destino_entity, formatted_text)
-                        logger.info("Mensagem de texto enviada para o grupo principal (fallback)")
+                        os.remove(path)
+                    except:
+                        pass
                 else:
-                    await client.send_message(canal_destino_entity, formatted_text)
-                    logger.info("Mensagem de texto enviada para o grupo principal")
-                
-        except Exception as e:
-            logger.error(f"Erro ao encaminhar mensagem: {e}")
+                    formatted_text = f"[EDITADO] {prefix}{message.text}"
+                    
+                    try:
+                        if len(formatted_text) > 2000:
+                            chunks = [formatted_text[i:i+1999] for i in range(0, len(formatted_text), 1999)]
+                            for i, chunk in enumerate(chunks):
+                                if i == 0:
+                                    await discord_channel.send(chunk)
+                                else:
+                                    await discord_channel.send(f"(Continuação) {chunk}")
+                        else:
+                            await discord_channel.send(formatted_text)
+                        
+                        logger.info(f"Mensagem de texto editada enviada para o canal Discord: {discord_channel.name}")
+                    except Exception as e:
+                        logger.error(f"Erro ao enviar texto editado para Discord: {e}")
+                    
+            except Exception as e:
+                logger.error(f"Erro ao processar mensagem editada: {e}")
 
-    @client.on(events.MessageEdited(chats=canal_origem_entity))
-    async def on_edit(event):
-        message = event.message
-        
-        try:
-            topic_id = None
-            if hasattr(message, 'reply_to') and message.reply_to:
-                if hasattr(message.reply_to, 'reply_to_top_id') and message.reply_to.reply_to_top_id:
-                    topic_id = message.reply_to.reply_to_top_id
-                    if topic_id in TOPICOS_IGNORADOS:
-                        logger.info(f"Mensagem do tópico ignorado: {topic_id}")
-                        return
-            
-            sender = await event.get_sender()
-            sender_name = getattr(sender, 'first_name', '') or getattr(sender, 'title', '')
-            if hasattr(sender, 'last_name') and sender.last_name:
-                sender_name += f" {sender.last_name}"
-            
-            if not sender_name:
-                sender_name = getattr(sender, 'username', '') or f"ID:{sender.id}"
-            
-            prefix = f"{sender_name} - "
-            
-            topic_id, topic_title = await get_topic_info(message)
-            
-            destino_topic_id = None
-            
-            if topic_id and suporta_forum:
-                logger.info(f"Mensagem editada do tópico: {topic_title} (ID: {topic_id})")
-                destino_topic_id = await get_or_create_topic(topic_title, topic_id)
-            
-            if message.media:
-                logger.info(f"Mensagem com mídia detectada de {sender_name}")
-                
-                path = await message.download_media("./downloads/")
-                
-                caption = f"[EDITADO] {prefix}{message.text}" if message.text else f"[EDITADO] {prefix}".rstrip(" -")
-                
-                if destino_topic_id:
-                    try:
-                        await client.send_file(
-                            canal_destino_entity,
-                            path,
-                            caption=caption,
-                            reply_to=destino_topic_id
-                        )
-                        logger.info(f"Mídia editada enviada para o tópico {destino_topic_id}")
-                    except Exception as e:
-                        logger.error(f"Erro ao enviar mídia editada para tópico {destino_topic_id}: {e}")
-                        await client.send_file(
-                            canal_destino_entity,
-                            path,
-                            caption=caption
-                        )
-                        logger.info("Mídia editada enviada para o grupo principal (fallback)")
-                else:
-                    await client.send_file(
-                        canal_destino_entity,
-                        path,
-                        caption=caption
-                    )
-                    logger.info("Mídia editada enviada para o grupo principal")
-                
-                try:
-                    os.remove(path)
-                except:
-                    pass
-            else:
-                formatted_text = f"[EDITADO] {prefix}{message.text}"
-                
-                if destino_topic_id:
-                    try:
-                        await client.send_message(
-                            canal_destino_entity,
-                            formatted_text,
-                            reply_to=destino_topic_id
-                        )
-                        logger.info(f"Mensagem de texto editada enviada para o tópico {destino_topic_id}")
-                    except Exception as e:
-                        logger.error(f"Erro ao enviar mensagem editada para tópico {destino_topic_id}: {e}")
-                        await client.send_message(canal_destino_entity, formatted_text)
-                        logger.info("Mensagem de texto editada enviada para o grupo principal (fallback)")
-                else:
-                    await client.send_message(canal_destino_entity, formatted_text)
-                    logger.info("Mensagem de texto editada enviada para o grupo principal")
-                
-        except Exception as e:
-            logger.error(f"Erro ao processar mensagem editada: {e}")
-
-    logger.info(f"Monitorando mensagens do canal {CANAL_ORIGEM}...")
-    logger.info("Pressione Ctrl+C para parar")
+        logger.info(f"Monitorando mensagens do canal Telegram {CANAL_ORIGEM}...")
+        logger.info("Pressione Ctrl+C para parar")
 
     try:
-        await client.run_until_disconnected()
+        await telegram_client.run_until_disconnected()
     except KeyboardInterrupt:
         logger.info("Programa interrompido pelo usuário")
     finally:
-        await client.disconnect()
-        logger.info("Cliente desconectado")
+        await telegram_client.disconnect()
+        await discord_client.close()
+        logger.info("Clientes desconectados")
 
 if __name__ == "__main__":
     asyncio.run(main())
